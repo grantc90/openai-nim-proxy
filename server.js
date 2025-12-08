@@ -1,4 +1,4 @@
-// server.js - OpenAI to NVIDIA NIM API Proxy
+// server.js - OpenAI to NVIDIA NIM Proxy with Lorebrary Integration
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -6,43 +6,98 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors());
-app.use(express.json());
-
-// NVIDIA NIM API configuration
+// API Configuration
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
+const LOREBRARY_API_KEY = process.env.LOREBRARY_API_KEY; // Add this
+const LOREBRARY_API_BASE = 'https://api.lorebrary.com/v1'; // Lorebrary endpoint
 
-// 🔥 REASONING DISPLAY TOGGLE - Shows/hides reasoning in output
-const SHOW_REASONING = true; // Set to true to show reasoning with <think> tags
+// Configuration toggles
+const SHOW_REASONING = true;
+const ENABLE_THINKING_MODE = true;
+const ENABLE_LOREBRARY = true; // Toggle lorebook integration
 
-// 🔥 THINKING MODE TOGGLE - Enables thinking for specific models that support it
-const ENABLE_THINKING_MODE = true; // Set to true to enable chat_template_kwargs thinking parameter
-
-// Model mapping (adjust based on available NIM models)
+// Model mapping
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
   'gpt-4': 'qwen/qwen3-coder-480b-a35b-instruct',
   'gpt-4-turbo': 'moonshotai/kimi-k2-instruct-0905',
   'gpt-4o': 'deepseek-ai/deepseek-v3.1',
-  'deepseek-r1': 'deepseek-ai/deepseek-r1-0528',
+  'deepseek-r1': 'deepseek-ai/deepseek-r1',
   'claude-3-opus': 'openai/gpt-oss-120b',
   'claude-3-sonnet': 'openai/gpt-oss-20b',
   'gemini-pro': 'qwen/qwen3-next-80b-a3b-thinking' 
 };
 
+// Function to fetch lorebook entries
+async function fetchLorebookEntries(messages, characterId) {
+  if (!ENABLE_LOREBRARY || !LOREBRARY_API_KEY) {
+    return [];
+  }
+
+  try {
+    // Extract recent conversation context
+    const recentMessages = messages.slice(-5).map(m => m.content).join(' ');
+    
+    const response = await axios.post(`${LOREBRARY_API_BASE}/lorebooks/query`, {
+      character_id: characterId,
+      query: recentMessages,
+      max_entries: 10
+    }, {
+      headers: {
+        'Authorization': `Bearer ${LOREBRARY_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 5000
+    });
+
+    return response.data.entries || [];
+  } catch (error) {
+    console.error('Lorebrary fetch error:', error.message);
+    return []; // Fail gracefully
+  }
+}
+
+// Function to inject lorebook into messages
+function injectLorebook(messages, lorebookEntries) {
+  if (!lorebookEntries || lorebookEntries.length === 0) {
+    return messages;
+  }
+
+  // Create lorebook context string
+  const lorebookContext = lorebookEntries
+    .map(entry => `[${entry.key}]: ${entry.content}`)
+    .join('\n\n');
+
+  // Find system message or create one
+  const systemMsgIndex = messages.findIndex(m => m.role === 'system');
+  
+  if (systemMsgIndex >= 0) {
+    // Append to existing system message
+    messages[systemMsgIndex].content += `\n\n--- Lorebook Context ---\n${lorebookContext}`;
+  } else {
+    // Insert new system message at the beginning
+    messages.unshift({
+      role: 'system',
+      content: `--- Lorebook Context ---\n${lorebookContext}`
+    });
+  }
+
+  return messages;
+}
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    service: 'OpenAI to NVIDIA NIM Proxy', 
+    service: 'OpenAI to NVIDIA NIM Proxy with Lorebrary', 
     reasoning_display: SHOW_REASONING,
-    thinking_mode: ENABLE_THINKING_MODE
+    thinking_mode: ENABLE_THINKING_MODE,
+    lorebrary_enabled: ENABLE_LOREBRARY && !!LOREBRARY_API_KEY
   });
 });
 
-// List models endpoint (OpenAI compatible)
+// List models endpoint
 app.get('/v1/models', (req, res) => {
   const models = Object.keys(MODEL_MAPPING).map(model => ({
     id: model,
@@ -57,10 +112,10 @@ app.get('/v1/models', (req, res) => {
   });
 });
 
-// Chat completions endpoint (main proxy)
+// Chat completions endpoint with lorebook support
 app.post('/v1/chat/completions', async (req, res) => {
   try {
-    const { model, messages, temperature, max_tokens, stream } = req.body;
+    let { model, messages, temperature, max_tokens, stream, character_id } = req.body;
     
     // Smart model selection with fallback
     let nimModel = MODEL_MAPPING[model];
@@ -91,6 +146,12 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
       }
     }
+
+    // Fetch and inject lorebook if enabled
+    if (ENABLE_LOREBRARY && character_id) {
+      const lorebookEntries = await fetchLorebookEntries(messages, character_id);
+      messages = injectLorebook(messages, lorebookEntries);
+    }
     
     // Transform OpenAI request to NIM format
     const nimRequest = {
@@ -112,7 +173,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     });
     
     if (stream) {
-      // Handle streaming response with reasoning
+      // Handle streaming response
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
@@ -122,13 +183,13 @@ app.post('/v1/chat/completions', async (req, res) => {
       
       response.data.on('data', (chunk) => {
         buffer += chunk.toString();
-        const lines = buffer.split('\\n');
+        const lines = buffer.split('\n');
         buffer = lines.pop() || '';
         
         lines.forEach(line => {
           if (line.startsWith('data: ')) {
             if (line.includes('[DONE]')) {
-              res.write(line + '\\n');
+              res.write(line + '\n');
               return;
             }
             
@@ -142,14 +203,14 @@ app.post('/v1/chat/completions', async (req, res) => {
                   let combinedContent = '';
                   
                   if (reasoning && !reasoningStarted) {
-                    combinedContent = '<think>\\n' + reasoning;
+                    combinedContent = '<think>\n' + reasoning;
                     reasoningStarted = true;
                   } else if (reasoning) {
                     combinedContent = reasoning;
                   }
                   
                   if (content && reasoningStarted) {
-                    combinedContent += '</think>\\n\\n' + content;
+                    combinedContent += '</think>\n\n' + content;
                     reasoningStarted = false;
                   } else if (content) {
                     combinedContent += content;
@@ -168,9 +229,9 @@ app.post('/v1/chat/completions', async (req, res) => {
                   delete data.choices[0].delta.reasoning_content;
                 }
               }
-              res.write(`data: ${JSON.stringify(data)}\\n\\n`);
+              res.write(`data: ${JSON.stringify(data)}\n\n`);
             } catch (e) {
-              res.write(line + '\\n');
+              res.write(line + '\n');
             }
           }
         });
@@ -182,7 +243,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         res.end();
       });
     } else {
-      // Transform NIM response to OpenAI format with reasoning
+      // Transform NIM response to OpenAI format
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
@@ -192,7 +253,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           let fullContent = choice.message?.content || '';
           
           if (SHOW_REASONING && choice.message?.reasoning_content) {
-            fullContent = '<think>\\n' + choice.message.reasoning_content + '\\n</think>\\n\\n' + fullContent;
+            fullContent = '<think>\n' + choice.message.reasoning_content + '\n</think>\n\n' + fullContent;
           }
           
           return {
@@ -227,7 +288,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
 });
 
-// Catch-all for unsupported endpoints
+// Catch-all
 app.all('*', (req, res) => {
   res.status(404).json({
     error: {
@@ -239,8 +300,6 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
-  console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`OpenAI to NVIDIA NIM Proxy with Lorebrary running on port ${PORT}`);
+  console.log(`Lorebrary: ${ENABLE_LOREBRARY && LOREBRARY_API_KEY ? 'ENABLED' : 'DISABLED'}`);
 });
